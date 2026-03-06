@@ -1,0 +1,908 @@
+<script src="/socket.io/socket.io.js"></script>
+<script>
+(function() {
+    const socket = io();
+
+    // ----- state -----
+    let currentUser = null;
+    let currentChannel = 'general';
+    let currentView = 'home';
+    let typingTimeout = null;
+    let currentReplyTo = null;
+
+    // Data stores (synced from server)
+    let messages = [];
+    let users = [];
+    let friends = [];
+    let friendRequests = [];
+    let notifications = [];
+    let muted = [];
+
+    // DOM elements
+    const authView = document.getElementById('auth-view');
+    const chatView = document.getElementById('chat-view');
+    const loginTab = document.getElementById('login-tab');
+    const registerTab = document.getElementById('register-tab');
+    const loginFormDiv = document.getElementById('login-form');
+    const registerFormDiv = document.getElementById('register-form');
+    const loginBtn = document.getElementById('login-btn');
+    const registerBtn = document.getElementById('register-btn');
+    const loginError = document.getElementById('login-error');
+    const registerError = document.getElementById('register-error');
+    const loginEmail = document.getElementById('login-email');
+    const loginPassword = document.getElementById('login-password');
+    const registerEmail = document.getElementById('register-email');
+    const registerUsername = document.getElementById('register-username');
+    const registerPassword = document.getElementById('register-password');
+    const registerConfirm = document.getElementById('register-confirm');
+    const messagesContainer = document.getElementById('messages-container');
+    const messageInput = document.getElementById('message-input');
+    const sendBtn = document.getElementById('send-message-btn');
+    const channelNameSpan = document.getElementById('channel-name');
+    const typingIndicator = document.getElementById('typing-indicator');
+    const typingMessageSpan = document.getElementById('typing-message');
+    const profilePopup = document.getElementById('profile-popup');
+    const settingsGear = document.getElementById('settings-gear');
+    const settingsDropdown = document.getElementById('settings-dropdown');
+    const themeToggle = document.getElementById('theme-toggle');
+    const avatarOptions = document.querySelectorAll('.avatar-option');
+    const avatarUpload = document.getElementById('avatar-upload');
+    const notificationBell = document.getElementById('notification-bell');
+    const notificationsDropdown = document.getElementById('notifications-dropdown');
+    const contextMenu = document.getElementById('context-menu');
+    const serverHome = document.getElementById('server-home');
+    const serverDm = document.getElementById('server-dm');
+    const serverFriends = document.getElementById('server-friends');
+    const leftPanel = document.getElementById('left-panel');
+    const memberListDiv = document.getElementById('members-sidebar');
+    const adminClearChat = document.getElementById('admin-clear-chat');
+    const clearChatBtn = document.getElementById('clear-chat-btn');
+
+    // ================== Helper functions ==================
+    function escapeHTML(unsafe) {
+        return unsafe.replace(/[&<>"]/g, function(m) {
+            if (m === '&') return '&amp;';
+            if (m === '<') return '&lt;';
+            if (m === '>') return '&gt;';
+            if (m === '"') return '&quot;';
+            return m;
+        });
+    }
+
+    function renderAvatar(element, avatar) {
+        if (!element) return;
+        if (avatar && avatar.startsWith('data:')) {
+            element.innerHTML = `<img src="${avatar}" alt="avatar">`;
+        } else {
+            element.textContent = avatar || '😀';
+        }
+    }
+
+    // ================== UI Rendering ==================
+    function renderMessages(channel) {
+        const filtered = messages.filter(m => m.channel === channel).sort((a,b) => a.timestamp - b.timestamp);
+        messagesContainer.innerHTML = '';
+        filtered.forEach(msg => {
+            const msgDiv = document.createElement('div');
+            msgDiv.className = 'message';
+            msgDiv.setAttribute('data-message-id', msg.id);
+
+            if (msg.replyTo && currentUser) {
+                const repliedMsg = messages.find(m => m.id === msg.replyTo);
+                if (repliedMsg && repliedMsg.username === currentUser.username) {
+                    msgDiv.classList.add('reply-highlight');
+                }
+            }
+
+            const date = new Date(msg.timestamp);
+            const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const user = users.find(u => u.username === msg.username);
+            const roleClass = user?.role === 'owner' ? 'owner' : user?.role === 'admin' ? 'admin' : '';
+            const roleTag = roleClass ? `<span class="role-tag ${roleClass}">${roleClass}</span>` : '';
+
+            let replyHtml = '';
+            if (msg.replyTo) {
+                const replyMsg = messages.find(m => m.id === msg.replyTo);
+                if (replyMsg) {
+                    replyHtml = `<span class="reply-to" data-reply-id="${msg.replyTo}">↩️ ${replyMsg.username}</span>`;
+                }
+            }
+
+            let replyPreviewHtml = '';
+            if (msg.replyTo) {
+                const replied = messages.find(m => m.id === msg.replyTo);
+                if (replied) {
+                    const previewText = replied.text.length > 50 ? replied.text.substring(0, 47) + '...' : replied.text;
+                    replyPreviewHtml = `<div class="reply-preview"><i class="fas fa-reply"></i> ${escapeHTML(previewText)}</div>`;
+                }
+            }
+
+            const avatarHtml = (user?.avatar && user.avatar.startsWith('data:')) ? `<img src="${user.avatar}">` : (user?.avatar || '😀');
+
+            msgDiv.innerHTML = `
+                <div class="message-avatar" data-user="${msg.username}">${avatarHtml}</div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="message-author" data-user="${msg.username}">${escapeHTML(msg.username)}</span>
+                        ${roleTag}
+                        ${replyHtml}
+                        <span class="message-time">${timeStr}</span>
+                    </div>
+                    ${replyPreviewHtml}
+                    <div class="message-text">${escapeHTML(msg.text)}</div>
+                </div>
+            `;
+            messagesContainer.appendChild(msgDiv);
+        });
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+
+    function renderMemberList() {
+        const onlineUsernames = new Set(); // We'll track online via presence events
+        // For now, just render all users with offline style; presence updates will re-render
+        const owner = users.filter(u => u.role === 'owner');
+        const admins = users.filter(u => u.role === 'admin');
+        const members = users.filter(u => u.role === 'user');
+        // Offline detection would come from presence events – simplified here
+
+        memberListDiv.innerHTML = '';
+
+        function renderSection(title, userList) {
+            if (userList.length === 0) return;
+            const section = document.createElement('div');
+            section.className = 'members-section';
+            section.innerHTML = `<h3>${title}</h3>`;
+            userList.forEach(u => {
+                const item = document.createElement('div');
+                item.className = 'member-item'; // 'offline' class could be added based on presence
+                item.setAttribute('data-user', u.username);
+                const avatarHtml = (u.avatar && u.avatar.startsWith('data:')) ? `<img src="${u.avatar}">` : (u.avatar || '😀');
+                item.innerHTML = `
+                    <div class="member-avatar" data-user="${u.username}">${avatarHtml}</div>
+                    <span class="member-name" data-user="${u.username}">${escapeHTML(u.username)} ${u.role === 'owner' ? '👑' : (u.role === 'admin' ? '🛡️' : '')}</span>
+                `;
+                section.appendChild(item);
+            });
+            memberListDiv.appendChild(section);
+        }
+
+        renderSection('OWNER', owner);
+        renderSection('ADMINS', admins);
+        renderSection('MEMBERS', members);
+        renderSection('OFFLINE', []); // We'll handle offline via class later
+    }
+
+    function renderDmList() {
+        if (!currentUser) return;
+        let html = `
+            <div class="friends-header">
+                <span>Direct Messages</span>
+            </div>
+            <div class="friends-list">
+        `;
+        if (friends.length === 0) {
+            html += `<div style="padding:8px;">No friends yet. Add some!</div>`;
+        } else {
+            friends.forEach(f => {
+                const friendUser = users.find(u => u.username === f);
+                if (!friendUser) return;
+                const avatarHtml = (friendUser.avatar && friendUser.avatar.startsWith('data:')) ? `<img src="${friendUser.avatar}">` : (friendUser.avatar || '😀');
+                const onlineClass = ''; // We'll add online class later via presence
+
+                const sorted = [currentUser.username, f].sort();
+                const dmChannel = `dm_${sorted[0]}_${sorted[1]}`;
+                const unreadCount = 0; // We'll implement last read later if needed
+
+                html += `
+                    <div class="friend-item dm-item ${onlineClass}" data-user="${f}" data-channel="${dmChannel}" title="${escapeHTML(f)}">
+                        <div class="friend-avatar">
+                            ${avatarHtml}
+                            ${unreadCount > 0 ? `<span class="unread-badge">${unreadCount}</span>` : ''}
+                        </div>
+                        <span class="friend-name">${escapeHTML(f)}</span>
+                    </div>
+                `;
+            });
+        }
+        html += `</div>`;
+        leftPanel.innerHTML = html;
+        leftPanel.className = 'friends-panel';
+
+        document.querySelectorAll('.dm-item').forEach(el => {
+            el.addEventListener('click', () => {
+                const other = el.getAttribute('data-user');
+                const channel = el.getAttribute('data-channel');
+                openDM(currentUser.username, other, channel);
+            });
+        });
+    }
+
+    function renderFriendsPanel() {
+        if (!currentUser) return;
+        let html = `
+            <div class="friends-header">
+                <span>Friends</span>
+            </div>
+            <div class="friends-list">
+        `;
+        if (friendRequests.length > 0) {
+            html += `<div style="padding:8px; color:#f0b232;">Friend requests</div>`;
+            friendRequests.forEach(req => {
+                const reqUser = users.find(u => u.username === req);
+                const avatarHtml = (reqUser?.avatar && reqUser.avatar.startsWith('data:')) ? `<img src="${reqUser.avatar}">` : (reqUser?.avatar || '😀');
+                html += `
+                    <div class="friend-item friend-request" data-user="${req}">
+                        <div class="friend-avatar">${avatarHtml}</div>
+                        <span class="friend-name">${escapeHTML(req)}</span>
+                        <span class="friend-request-badge">request</span>
+                    </div>
+                `;
+            });
+        }
+        html += `<div style="padding:8px;">Your friends</div>`;
+        friends.forEach(f => {
+            const friendUser = users.find(u => u.username === f);
+            const avatarHtml = (friendUser?.avatar && friendUser.avatar.startsWith('data:')) ? `<img src="${friendUser.avatar}">` : (friendUser?.avatar || '😀');
+            html += `
+                <div class="friend-item" data-user="${f}">
+                    <div class="friend-avatar">${avatarHtml}</div>
+                    <span class="friend-name">${escapeHTML(f)}</span>
+                </div>
+            `;
+        });
+        html += `
+                </div>
+                <div class="friends-footer">
+                    <input type="text" id="add-friend-input" placeholder="Add friend by username">
+                    <button id="add-friend-btn">Send request</button>
+                </div>
+            `;
+        leftPanel.innerHTML = html;
+        leftPanel.className = 'friends-panel';
+
+        document.getElementById('add-friend-btn').addEventListener('click', () => {
+            const target = document.getElementById('add-friend-input').value.trim();
+            if (!target) return;
+            socket.emit('send_friend_request', target);
+        });
+
+        document.querySelectorAll('.friend-request').forEach(el => {
+            el.addEventListener('click', () => {
+                const from = el.getAttribute('data-user');
+                socket.emit('accept_friend_request', from);
+            });
+        });
+    }
+
+    function renderChannelsSidebar() {
+        if (!currentUser) return;
+        leftPanel.innerHTML = `
+            <div class="channels-header">
+                <span>Text channels</span>
+                <i class="fas fa-plus"></i>
+            </div>
+            <div class="channels-list" id="channels-list">
+                <div class="channel-item active" data-channel="general"><i class="fas fa-hashtag"></i> general</div>
+                <div class="channel-item" data-channel="random"><i class="fas fa-hashtag"></i> random</div>
+            </div>
+            <div class="user-profile" id="user-profile">
+                <div class="user-avatar" id="current-user-avatar"></div>
+                <div class="user-info" id="current-username">${escapeHTML(currentUser.username)}</div>
+                <i class="fas fa-sign-out-alt logout-icon" id="logout-btn"></i>
+            </div>
+        `;
+        leftPanel.className = 'channels-sidebar';
+
+        const currentUserAvatar = document.getElementById('current-user-avatar');
+        const logoutBtn = document.getElementById('logout-btn');
+        const user = users.find(u => u.username === currentUser.username);
+        renderAvatar(currentUserAvatar, user?.avatar);
+
+        document.querySelectorAll('.channel-item').forEach(item => {
+            item.addEventListener('click', (e) => {
+                const channel = e.currentTarget.dataset.channel;
+                setActiveChannel(channel);
+            });
+        });
+
+        if (logoutBtn) {
+            logoutBtn.addEventListener('click', logout);
+        }
+    }
+
+    function setActiveChannel(channel) {
+        if (typingTimeout) clearTimeout(typingTimeout);
+        socket.emit('typing', { channel: currentChannel, isTyping: false }); // stop typing in old channel
+        currentChannel = channel;
+        document.querySelectorAll('.channel-item').forEach(ch => {
+            ch.classList.toggle('active', ch.dataset.channel === channel);
+        });
+        channelNameSpan.textContent = channel;
+        renderMessages(channel);
+        updatePlaceholder();
+    }
+
+    function openDM(userA, userB, channelName) {
+        currentChannel = channelName;
+        currentView = 'dm';
+        const other = userA === userB ? userB : (userA === currentUser.username ? userB : userA);
+        channelNameSpan.textContent = `@${other}`;
+        renderMessages(channelName);
+        updatePlaceholder();
+        document.querySelectorAll('.server-icon').forEach(icon => icon.classList.remove('active'));
+        serverDm.classList.add('active');
+        renderDmList();
+    }
+
+    function updatePlaceholder() {
+        if (currentReplyTo) {
+            messageInput.placeholder = `Replying to ${currentReplyTo.username}...`;
+        } else if (currentChannel.startsWith('dm')) {
+            const parts = currentChannel.split('_');
+            const other = parts[1] === currentUser.username ? parts[2] : parts[1];
+            messageInput.placeholder = `Message @${other}`;
+        } else {
+            messageInput.placeholder = `Message #${currentChannel}`;
+        }
+    }
+
+    function showProfilePopup(user, x, y) {
+        if (!currentUser) return;
+        const isOwner = currentUser.role === 'owner';
+        const isAdmin = currentUser.role === 'admin';
+        const targetUser = users.find(u => u.username === user);
+        if (!targetUser) return;
+
+        let html = `<button class="profile-message"><i class="fas fa-envelope"></i> Message</button>`;
+        html += `<button class="profile-friend"><i class="fas fa-user-plus"></i> Friend</button>`;
+
+        if (isOwner || isAdmin) {
+            html += `<button class="profile-warn admin-only"><i class="fas fa-exclamation-triangle"></i> Warn</button>`;
+            html += `<button class="profile-mute admin-only"><i class="fas fa-microphone-slash"></i> ${muted.includes(user) ? 'Unmute' : 'Mute'}</button>`;
+        }
+        if (isOwner) {
+            if (targetUser.role !== 'owner' && targetUser.role !== 'admin') {
+                html += `<button class="profile-make-admin owner-only"><i class="fas fa-user-cog"></i> Make admin</button>`;
+            }
+            html += `<button class="profile-ban owner-only"><i class="fas fa-ban"></i> Ban</button>`;
+        }
+
+        profilePopup.innerHTML = html;
+        profilePopup.style.left = x + 'px';
+        profilePopup.style.top = y + 'px';
+        profilePopup.classList.add('show');
+
+        const rect = profilePopup.getBoundingClientRect();
+        if (rect.right > window.innerWidth) {
+            profilePopup.style.left = (window.innerWidth - rect.width - 10) + 'px';
+        }
+        if (rect.bottom > window.innerHeight) {
+            profilePopup.style.top = (window.innerHeight - rect.height - 10) + 'px';
+        }
+
+        profilePopup.querySelector('.profile-message')?.addEventListener('click', () => {
+            const sorted = [currentUser.username, user].sort();
+            const dmChannel = `dm_${sorted[0]}_${sorted[1]}`;
+            openDM(currentUser.username, user, dmChannel);
+            profilePopup.classList.remove('show');
+        });
+        profilePopup.querySelector('.profile-friend')?.addEventListener('click', () => {
+            socket.emit('send_friend_request', user);
+            profilePopup.classList.remove('show');
+        });
+        if (isOwner || isAdmin) {
+            profilePopup.querySelector('.profile-warn')?.addEventListener('click', () => {
+                // Warn just sends a system message
+                const warnMsg = {
+                    username: 'system',
+                    text: `⚠️ ${user} has been warned by ${currentUser.username}.`,
+                    channel: currentChannel,
+                    timestamp: Date.now(),
+                    id: Date.now().toString() + 'warn'
+                };
+                socket.emit('send_message', warnMsg);
+                profilePopup.classList.remove('show');
+            });
+            profilePopup.querySelector('.profile-mute')?.addEventListener('click', () => {
+                socket.emit('mute_user', user);
+                profilePopup.classList.remove('show');
+            });
+        }
+        if (isOwner) {
+            const makeAdminBtn = profilePopup.querySelector('.profile-make-admin');
+            if (makeAdminBtn) {
+                makeAdminBtn.addEventListener('click', () => {
+                    socket.emit('make_admin', user);
+                    profilePopup.classList.remove('show');
+                });
+            }
+            profilePopup.querySelector('.profile-ban')?.addEventListener('click', () => {
+                socket.emit('ban_user', user);
+                profilePopup.classList.remove('show');
+            });
+        }
+    }
+
+    // ================== Socket event handlers ==================
+    socket.on('login_success', (userData) => {
+        currentUser = { username: userData.username, role: userData.role, avatar: userData.avatar };
+        sessionStorage.setItem('discord_current_user', JSON.stringify(currentUser));
+        enterChat();
+    });
+
+    socket.on('login_error', (msg) => {
+        loginError.textContent = msg;
+    });
+
+    socket.on('register_success', (userData) => {
+        currentUser = { username: userData.username, role: userData.role, avatar: userData.avatar };
+        sessionStorage.setItem('discord_current_user', JSON.stringify(currentUser));
+        enterChat();
+    });
+
+    socket.on('register_error', (msg) => {
+        registerError.textContent = msg;
+    });
+
+    socket.on('initial_messages', (msgs) => {
+        messages = msgs;
+        renderMessages(currentChannel);
+    });
+
+    socket.on('initial_users', (userList) => {
+        users = userList;
+        renderMemberList();
+    });
+
+    socket.on('initial_friends', (friendList) => {
+        friends = friendList;
+    });
+
+    socket.on('initial_friend_requests', (reqList) => {
+        friendRequests = reqList;
+    });
+
+    socket.on('initial_notifications', (notifList) => {
+        notifications = notifList;
+        updateNotificationBadge();
+    });
+
+    socket.on('new_message', (msg) => {
+        messages.push(msg);
+        if (msg.channel === currentChannel) {
+            renderMessages(currentChannel);
+        }
+        // Update unread counts for DMs if needed
+    });
+
+    socket.on('typing_update', ({ channel, typing }) => {
+        if (channel === currentChannel) {
+            const filtered = typing.filter(u => u !== currentUser?.username);
+            if (filtered.length === 0) {
+                typingIndicator.classList.add('hidden');
+            } else {
+                let message = '';
+                if (filtered.length === 1) {
+                    message = `${filtered[0]} is typing...`;
+                } else if (filtered.length === 2) {
+                    message = `${filtered[0]} and ${filtered[1]} are typing...`;
+                } else {
+                    message = `Several people are typing...`;
+                }
+                typingMessageSpan.textContent = message;
+                typingIndicator.classList.remove('hidden');
+            }
+        }
+    });
+
+    socket.on('user_joined', (username) => {
+        // Add user to list if not present
+        if (!users.some(u => u.username === username)) {
+            users.push({ username, role: 'user', avatar: '😀' }); // we'll get full info later
+        }
+        renderMemberList();
+        // Optionally show a system message
+        const joinMsg = {
+            username: 'system',
+            text: `${username} joined the chat`,
+            channel: 'general', // maybe broadcast to all?
+            timestamp: Date.now(),
+            id: Date.now().toString() + 'join'
+        };
+        messages.push(joinMsg);
+        if (currentChannel === 'general') renderMessages('general');
+    });
+
+    socket.on('user_left', (username) => {
+        // Remove from users? We'll keep but mark offline; presence will handle
+        renderMemberList();
+        const leftMsg = {
+            username: 'system',
+            text: `${username} left the chat`,
+            channel: 'general',
+            timestamp: Date.now(),
+            id: Date.now().toString() + 'left'
+        };
+        messages.push(leftMsg);
+        if (currentChannel === 'general') renderMessages('general');
+    });
+
+    socket.on('user_presence', ({ username, online }) => {
+        // Update online status in member list – we'll add a class
+        const memberItems = document.querySelectorAll(`.member-item[data-user="${username}"]`);
+        memberItems.forEach(el => {
+            if (online) el.classList.remove('offline');
+            else el.classList.add('offline');
+        });
+    });
+
+    socket.on('new_friend_request', (from) => {
+        if (!friendRequests.includes(from)) friendRequests.push(from);
+        if (currentView === 'friends') renderFriendsPanel();
+    });
+
+    socket.on('friend_accepted', (from) => {
+        friendRequests = friendRequests.filter(r => r !== from);
+        if (!friends.includes(from)) friends.push(from);
+        if (currentView === 'friends') renderFriendsPanel();
+        if (currentView === 'dm') renderDmList();
+    });
+
+    socket.on('new_notification', (notif) => {
+        notifications.unshift(notif);
+        updateNotificationBadge();
+    });
+
+    socket.on('user_muted', ({ username, muted: isMuted }) => {
+        if (isMuted && !muted.includes(username)) muted.push(username);
+        else if (!isMuted) muted = muted.filter(u => u !== username);
+    });
+
+    socket.on('user_banned', (username) => {
+        users = users.filter(u => u.username !== username);
+        if (currentUser && username === currentUser.username) {
+            alert('You have been banned.');
+            logout();
+        } else {
+            renderMemberList();
+        }
+    });
+
+    socket.on('user_role_changed', ({ username, role }) => {
+        const user = users.find(u => u.username === username);
+        if (user) user.role = role;
+        renderMemberList();
+        renderMessages(currentChannel);
+    });
+
+    socket.on('banned', () => {
+        alert('You have been banned.');
+        logout();
+    });
+
+    socket.on('error', (msg) => {
+        alert(msg);
+    });
+
+    // ================== User actions ==================
+    function sendMessage() {
+        const text = messageInput.value.trim();
+        if (!text || !currentUser) return;
+        if (muted.includes(currentUser.username)) {
+            alert('You are muted.');
+            return;
+        }
+        const msgData = {
+            text: text,
+            channel: currentChannel,
+            replyTo: currentReplyTo ? currentReplyTo.id : null
+        };
+        socket.emit('send_message', msgData);
+        messageInput.value = '';
+        currentReplyTo = null;
+        updatePlaceholder();
+        socket.emit('typing', { channel: currentChannel, isTyping: false });
+    }
+
+    // ================== Authentication ==================
+    loginBtn.addEventListener('click', () => {
+        const email = loginEmail.value.trim();
+        const password = loginPassword.value.trim();
+        socket.emit('login', { email, password });
+    });
+
+    registerBtn.addEventListener('click', () => {
+        const email = registerEmail.value.trim();
+        const username = registerUsername.value.trim();
+        const password = registerPassword.value.trim();
+        const confirm = registerConfirm.value.trim();
+        if (!email || !username || !password || !confirm) {
+            registerError.textContent = 'All fields required.';
+            return;
+        }
+        if (password !== confirm) {
+            registerError.textContent = 'Passwords do not match.';
+            return;
+        }
+        socket.emit('register', { email, username, password });
+    });
+
+    function logout() {
+        currentUser = null;
+        sessionStorage.removeItem('discord_current_user');
+        authView.classList.remove('hidden');
+        chatView.classList.add('hidden');
+        // Clear UI
+        messagesContainer.innerHTML = '';
+        memberListDiv.innerHTML = '';
+        leftPanel.innerHTML = '';
+        loginError.textContent = '';
+        registerError.textContent = '';
+        loginEmail.value = '';
+        loginPassword.value = '';
+        registerEmail.value = '';
+        registerUsername.value = '';
+        registerPassword.value = '';
+        registerConfirm.value = '';
+    }
+
+    function enterChat() {
+        authView.classList.add('hidden');
+        chatView.classList.remove('hidden');
+        // Request initial data (already sent by server on login)
+        // Set up UI
+        currentView = 'home';
+        renderChannelsSidebar();
+        setActiveChannel('general');
+        renderMemberList();
+        updatePlaceholder();
+
+        // Start presence heartbeat
+        setInterval(() => {
+            socket.emit('presence');
+        }, 10000);
+    }
+
+    // Check for existing session
+    const savedUser = sessionStorage.getItem('discord_current_user');
+    if (savedUser) {
+        currentUser = JSON.parse(savedUser);
+        socket.emit('reconnect_user', currentUser.username);
+        // UI will update after server sends initial data
+    } else {
+        authView.classList.remove('hidden');
+        chatView.classList.add('hidden');
+    }
+
+    // Tab switching
+    loginTab.addEventListener('click', () => {
+        loginTab.classList.add('active');
+        registerTab.classList.remove('active');
+        loginFormDiv.classList.remove('hidden');
+        registerFormDiv.classList.add('hidden');
+        loginError.textContent = '';
+        registerError.textContent = '';
+    });
+    registerTab.addEventListener('click', () => {
+        registerTab.classList.add('active');
+        loginTab.classList.remove('active');
+        registerFormDiv.classList.remove('hidden');
+        loginFormDiv.classList.add('hidden');
+        loginError.textContent = '';
+        registerError.textContent = '';
+    });
+
+    // Message sending
+    sendBtn.addEventListener('click', sendMessage);
+    messageInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+
+    messageInput.addEventListener('input', () => {
+        if (currentReplyTo && messageInput.value.trim() === '') {
+            currentReplyTo = null;
+            updatePlaceholder();
+        }
+        if (!currentUser) return;
+        const isTyping = messageInput.value.trim() !== '';
+        socket.emit('typing', { channel: currentChannel, isTyping });
+        if (typingTimeout) clearTimeout(typingTimeout);
+        if (isTyping) {
+            typingTimeout = setTimeout(() => {
+                socket.emit('typing', { channel: currentChannel, isTyping: false });
+                typingTimeout = null;
+            }, 2000);
+        }
+    });
+
+    // Profile popup triggers
+    memberListDiv.addEventListener('click', (e) => {
+        const user = e.target.closest('[data-user]')?.getAttribute('data-user');
+        if (user) {
+            const rect = e.target.closest('.member-item').getBoundingClientRect();
+            showProfilePopup(user, rect.right + 10, rect.top);
+        }
+    });
+
+    messagesContainer.addEventListener('click', (e) => {
+        const user = e.target.closest('[data-user]')?.getAttribute('data-user');
+        if (user) {
+            const rect = e.target.closest('.message-avatar, .message-author').getBoundingClientRect();
+            showProfilePopup(user, rect.right + 10, rect.top);
+        }
+        if (e.target.classList.contains('reply-to')) {
+            const replyId = e.target.getAttribute('data-reply-id');
+            const replyMsg = document.querySelector(`[data-message-id="${replyId}"]`);
+            if (replyMsg) {
+                replyMsg.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                replyMsg.style.backgroundColor = '#404249';
+                setTimeout(() => replyMsg.style.backgroundColor = '', 1000);
+            }
+        }
+    });
+
+    messagesContainer.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        const messageDiv = e.target.closest('.message');
+        if (!messageDiv) return;
+        const msgId = messageDiv.getAttribute('data-message-id');
+        const msg = messages.find(m => m.id === msgId);
+        if (!msg) return;
+        const isAdminOrOwner = currentUser && (currentUser.role === 'admin' || currentUser.role === 'owner');
+
+        let menuHtml = '';
+        menuHtml += `<button class="reply-msg">💬 Reply</button>`;
+        if (isAdminOrOwner) {
+            menuHtml += `<button class="delete-msg">🗑️ Delete</button>`;
+        }
+
+        contextMenu.innerHTML = menuHtml;
+        contextMenu.style.left = e.pageX + 'px';
+        contextMenu.style.top = e.pageY + 'px';
+        contextMenu.classList.add('show');
+
+        contextMenu.querySelector('.reply-msg')?.addEventListener('click', () => {
+            currentReplyTo = { id: msg.id, username: msg.username, text: msg.text };
+            messageInput.placeholder = `Replying to ${msg.username}...`;
+            messageInput.focus();
+            contextMenu.classList.remove('show');
+        });
+
+        if (isAdminOrOwner) {
+            contextMenu.querySelector('.delete-msg')?.addEventListener('click', () => {
+                // For simplicity, we don't implement delete on server yet – you can add later
+                contextMenu.classList.remove('show');
+            });
+        }
+    });
+
+    // Settings dropdown
+    settingsGear.addEventListener('click', (e) => {
+        e.stopPropagation();
+        settingsDropdown.classList.toggle('show');
+        if (currentUser && (currentUser.role === 'admin' || currentUser.role === 'owner')) {
+            adminClearChat.style.display = 'block';
+        } else {
+            adminClearChat.style.display = 'none';
+        }
+    });
+
+    clearChatBtn?.addEventListener('click', () => {
+        if (!currentUser || (currentUser.role !== 'admin' && currentUser.role !== 'owner')) return;
+        // Implement clear channel on server if desired
+        settingsDropdown.classList.remove('show');
+    });
+
+    themeToggle.addEventListener('click', () => {
+        document.body.classList.toggle('light-mode');
+    });
+
+    avatarOptions.forEach(opt => {
+        opt.addEventListener('click', () => {
+            const avatar = opt.getAttribute('data-avatar');
+            if (!currentUser) return;
+            // Update avatar on server (you'd need an event for this)
+            // For now, we just update locally
+            const user = users.find(u => u.username === currentUser.username);
+            if (user) user.avatar = avatar;
+            renderAvatar(document.getElementById('current-user-avatar'), avatar);
+            settingsDropdown.classList.remove('show');
+        });
+    });
+
+    avatarUpload.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            const avatar = event.target.result;
+            if (!currentUser) return;
+            const user = users.find(u => u.username === currentUser.username);
+            if (user) user.avatar = avatar;
+            renderAvatar(document.getElementById('current-user-avatar'), avatar);
+            settingsDropdown.classList.remove('show');
+        };
+        reader.readAsDataURL(file);
+    });
+
+    notificationBell.addEventListener('click', () => {
+        // Mark all as read
+        notifications.forEach(n => n.read = true);
+        updateNotificationBadge();
+        let html = '';
+        if (notifications.length === 0) {
+            html = '<div style="padding:12px;">No notifications</div>';
+        } else {
+            notifications.forEach(n => {
+                if (n.type === 'friend_request') {
+                    html += `<div class="notification-item">📩 Friend request from ${n.from}</div>`;
+                } else if (n.type === 'friend_accept') {
+                    html += `<div class="notification-item">✅ ${n.from} accepted your friend request</div>`;
+                } else if (n.type === 'reply') {
+                    html += `<div class="notification-item">💬 ${n.from} replied to your message</div>`;
+                }
+            });
+        }
+        notificationsDropdown.innerHTML = html;
+        notificationsDropdown.classList.toggle('show');
+    });
+
+    function updateNotificationBadge() {
+        const unread = notifications.filter(n => !n.read).length;
+        const badge = document.getElementById('notification-badge');
+        if (badge) {
+            if (unread > 0) {
+                badge.textContent = unread;
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+        }
+    }
+
+    serverHome.addEventListener('click', () => {
+        currentView = 'home';
+        setActiveChannel('general');
+        renderChannelsSidebar();
+        document.querySelectorAll('.server-icon').forEach(icon => icon.classList.remove('active'));
+        serverHome.classList.add('active');
+    });
+    serverDm.addEventListener('click', () => {
+        currentView = 'dm';
+        renderDmList();
+        document.querySelectorAll('.server-icon').forEach(icon => icon.classList.remove('active'));
+        serverDm.classList.add('active');
+        if (!currentChannel.startsWith('dm')) {
+            messagesContainer.innerHTML = '';
+            channelNameSpan.textContent = 'Direct Messages';
+        }
+    });
+    serverFriends.addEventListener('click', () => {
+        currentView = 'friends';
+        renderFriendsPanel();
+        document.querySelectorAll('.server-icon').forEach(icon => icon.classList.remove('active'));
+        serverFriends.classList.add('active');
+        messagesContainer.innerHTML = '';
+        channelNameSpan.textContent = 'Friends';
+    });
+
+    // Close dropdowns on click outside
+    document.addEventListener('click', (e) => {
+        if (!profilePopup.contains(e.target) && !e.target.closest('.member-item') && !e.target.closest('.message-avatar') && !e.target.closest('.message-author')) {
+            profilePopup.classList.remove('show');
+        }
+        if (!settingsDropdown.contains(e.target) && e.target !== settingsGear) {
+            settingsDropdown.classList.remove('show');
+        }
+        if (!notificationsDropdown.contains(e.target) && e.target !== notificationBell && !e.target.closest('.bell-icon')) {
+            notificationsDropdown.classList.remove('show');
+        }
+        if (!contextMenu.contains(e.target)) {
+            contextMenu.classList.remove('show');
+        }
+    });
+})();
+</script>
